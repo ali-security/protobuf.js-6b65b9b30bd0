@@ -216,3 +216,79 @@ tape.test("feature resolution edition 2023", function(test) {
 
     test.end();
 });
+
+// CVE-2026-41242 / GHSA-xq3m-2v4x-88gg: a reflected message type name is
+// interpolated verbatim into the source that util.codegen() hands to the
+// Function constructor ("return function <name>(...){...}"), so a descriptor
+// or reflection call carrying a hostile type name used to execute arbitrary
+// code through any of the generated functions: the message constructor
+// (Type.generateConstructor) as well as <name>$encode, <name>$decode,
+// <name>$verify, <name>$fromObject and <name>$toObject. Type names must be
+// filtered before they can reach the code generator.
+
+var INJECTION_FLAG = "__protobufjs_cve_2026_41242__";
+
+// Terminates the generated function's name, runs the payload through the
+// comma operator and re-opens a name, so the generated function keeps working
+// while the payload executes as soon as the generated source is evaluated.
+var INJECTION_NAME = "Evil(){}, global." + INJECTION_FLAG + " = true, function Evil";
+var INJECTION_NAME_FILTERED = "Evilglobal__protobufjs_cve_2026_41242__truefunctionEvil";
+
+function injectionFired() {
+    return global[INJECTION_FLAG] === true;
+}
+
+function resetInjection() {
+    delete global[INJECTION_FLAG];
+}
+
+tape.test("type names are filtered before reaching the code generator", function(test) {
+
+    resetInjection();
+
+    // Negative control: the payload really is live, executable code once it
+    // reaches util.codegen(), so the assertions below are not vacuous.
+    var gen = protobuf.util.codegen(["p"], INJECTION_NAME);
+    gen("return p");
+    var injected = gen();
+    test.ok(injectionFired(), "the unfiltered payload should execute when handed straight to util.codegen (negative control)");
+    test.equal(injected(42), 42, "the unfiltered payload should still yield a working generated function (negative control)");
+    resetInjection();
+
+    // The Type constructor is the choke point: every codegen sink derives its
+    // function name from Type#name.
+    var type = new protobuf.Type(INJECTION_NAME);
+    test.equal(type.name, INJECTION_NAME_FILTERED, "should strip non-word characters from a type name");
+    test.ok(/^\w+$/.test(type.name), "a filtered type name should only contain word characters");
+
+    test.equal(typeof type.ctor, "function", "should still generate a constructor for a filtered type name");
+    test.notOk(injectionFired(), "generating the constructor should not execute code injected through the type name");
+
+    // Same vector through a descriptor keyed by the hostile name.
+    var json = { nested: {} };
+    json.nested[INJECTION_NAME] = {
+        fields: {
+            value: { type: "string", id: 1 }
+        }
+    };
+    var root = protobuf.Root.fromJSON(json);
+    test.notOk(injectionFired(), "Root.fromJSON should not execute code injected through a type name");
+
+    var Evil = root.lookupType(INJECTION_NAME_FILTERED);
+    test.equal(Evil.name, INJECTION_NAME_FILTERED, "should register the type under its filtered name");
+
+    // The generated encoder, decoder, verifier and converters must keep
+    // working - and must not execute the payload either.
+    var message = Evil.fromObject({ value: "ok" });
+    var buffer = Evil.encode(message).finish();
+    var decoded = Evil.decode(buffer);
+    test.equal(Evil.verify(decoded), null, "the generated verifier should accept the decoded message");
+    test.same(Evil.toObject(decoded), { value: "ok" }, "encode, decode, fromObject and toObject should round-trip a filtered type");
+    test.notOk(injectionFired(), "the generated encoder, decoder, verifier and converters should not execute injected code");
+
+    // Valid names must survive the filter untouched.
+    test.equal(new protobuf.Type("ValidName_123").name, "ValidName_123", "should leave a valid type name untouched");
+
+    resetInjection();
+    test.end();
+});
